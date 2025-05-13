@@ -1,0 +1,356 @@
+import os
+import uuid
+import platform
+from pathlib import Path
+from PIL import Image
+import io
+import cloudinary.uploader
+from loguru import logger
+from sqlalchemy import create_engine, and_, text
+from sqlalchemy.orm import sessionmaker
+from utils.cloudinary_config import init_cloudinary
+from models.photo import Photo
+from models.salon import Salon
+from models.master import Master
+import psycopg2
+import sqlalchemy
+
+# Настройка логирования
+logger.add("logs/photo_upload_2025-05-09.log", rotation="1 MB", retention="10 days", level="INFO")
+
+# Логирование версий и окружения
+logger.info("Python version: {}", platform.python_version())
+logger.info("SQLAlchemy version: {}", sqlalchemy.__version__)
+logger.info("psycopg2 version: {}", getattr(psycopg2, '__version__', 'Not installed'))
+logger.info("Environment variables: LC_ALL={}, LANG={}, PYTHONIOENCODING={}",
+            os.getenv('LC_ALL'), os.getenv('LANG'), os.getenv('PYTHONIOENCODING'))
+
+# Настройка базы данных
+DATABASE_URL = "postgresql://api_user:0lSb1WwErdzkAMaJt2MaL738Sd5X453a@localhost:5432/HairsAndYou?client_encoding=UTF8"
+logger.info("Using DATABASE_URL: {}", DATABASE_URL)
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+
+# Путь к папке с фотографиями
+PHOTOS_DIR = Path("photos")
+SALONS_DIR = PHOTOS_DIR / "salons"
+MASTERS_DIR = PHOTOS_DIR / "masters"
+
+
+def validate_uuid(uuid_str):
+    """Проверяет, является ли строка валидным UUID."""
+    try:
+        uuid.UUID(uuid_str)
+        return True
+    except ValueError:
+        return False
+
+
+def entity_exists(session, entity_type, entity_id):
+    """Проверяет, существует ли сущность в базе данных."""
+    if entity_type == "salon":
+        return session.query(Salon).filter_by(id=entity_id).first() is not None
+    elif entity_type == "master":
+        return session.query(Master).filter_by(id=entity_id).first() is not None
+    return False
+
+
+def create_placeholder_image():
+    """Создает минимальное изображение-заглушку (1x1 пиксель, черное)."""
+    image = Image.new("RGB", (1, 1), color="black")
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def create_directory_structure(session):
+    """Создает структуру папок и заглушки для всех салонов и мастеров."""
+    logger.info("Checking directory structure at {}", PHOTOS_DIR)
+
+    # Проверка подключения к базе
+    logger.info("Checking database connection")
+    try:
+        with engine.connect() as conn:
+            logger.info("Executing test query: SELECT 1")
+            result = conn.execute(text("SELECT 1")).fetchone()
+            logger.info("Test query result: {}", result)
+        logger.info("Database connection successful")
+    except UnicodeDecodeError as e:
+        logger.error(f"Unicode decode error during database connection: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Database connection failed: {str(e)}")
+        raise
+
+    # Проверка наличия салонов и мастеров в базе
+    logger.info("Querying salon count")
+    try:
+        salon_count = session.query(Salon).count()
+        logger.info("Found {} salons in database", salon_count)
+    except UnicodeDecodeError as e:
+        logger.error(f"Unicode decode error while querying salons: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error querying salons: {str(e)}")
+        raise
+
+    logger.info("Querying master count")
+    try:
+        master_count = session.query(Master).count()
+        logger.info("Found {} masters in database", master_count)
+    except UnicodeDecodeError as e:
+        logger.error(f"Unicode decode error while querying masters: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error querying masters: {str(e)}")
+        raise
+
+    # Создание корневой папки
+    logger.info("Checking if photos directory exists")
+    try:
+        if not PHOTOS_DIR.exists():
+            PHOTOS_DIR.mkdir()
+            logger.info("Created root photos directory: {}", PHOTOS_DIR)
+    except Exception as e:
+        logger.error(f"Error creating photos directory: {str(e)}")
+        raise
+
+    # Создание папок salons и masters
+    created = False
+    for dir_path in [SALONS_DIR, MASTERS_DIR]:
+        logger.info(f"Checking if {dir_path} exists")
+        try:
+            if not dir_path.exists():
+                dir_path.mkdir(parents=True)
+                logger.info("Created directory: {}", dir_path)
+                created = True
+        except Exception as e:
+            logger.error(f"Error creating directory {dir_path}: {str(e)}")
+            raise
+
+    # Если создана хотя бы одна папка, создаем структуру и выходим
+    if created:
+        # Создание папок для салонов
+        logger.info("Querying all salons for directory creation")
+        try:
+            salons = session.query(Salon).all()
+            for salon in salons:
+                salon_dir = SALONS_DIR / str(salon.id)
+                logger.info(f"Creating directory for salon {salon.id}")
+                salon_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Created directory for salon {}: {}", salon.id, salon_dir)
+
+                # Создание заглушек
+                for filename in ["primary.jpg", "secondary1.jpg", "secondary2.jpg"]:
+                    file_path = salon_dir / filename
+                    if not file_path.exists():
+                        with open(file_path, "wb") as f:
+                            f.write(create_placeholder_image())
+                        logger.info("Created placeholder: {}", file_path)
+        except UnicodeDecodeError as e:
+            logger.error(f"Unicode decode error while processing salons: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing salons: {str(e)}")
+            raise
+
+        # Создание папок для мастеров
+        logger.info("Querying all masters for directory creation")
+        try:
+            masters = session.query(Master).all()
+            for master in masters:
+                master_dir = MASTERS_DIR / str(master.id)
+                logger.info(f"Creating directory for master {master.id}")
+                master_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("Created directory for master {}: {}", master.id, master_dir)
+
+                # Создание заглушек
+                for filename in ["primary.jpg", "secondary1.jpg", "secondary2.jpg"]:
+                    file_path = master_dir / filename
+                    if not file_path.exists():
+                        with open(file_path, "wb") as f:
+                            f.write(create_placeholder_image())
+                        logger.info("Created placeholder: {}", file_path)
+        except UnicodeDecodeError as e:
+            logger.error(f"Unicode decode error while processing masters: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing masters: {str(e)}")
+            raise
+
+        logger.info("Directory structure created. Replace placeholders with real images and rerun the script.")
+        return True
+    else:
+        logger.info("Directory structure already exists, proceeding to photo upload")
+    return False
+
+
+def is_placeholder(file_path):
+    """Проверяет, является ли файл заглушкой (1x1 пиксель)."""
+    try:
+        with Image.open(file_path) as img:
+            return img.size == (1, 1)
+    except Exception as e:
+        logger.error(f"Failed to check if {file_path} is placeholder: {str(e)}")
+        return False
+
+
+def upload_photos():
+    """Скрипт для создания структуры папок, загрузки фотографий в Cloudinary и обновления базы данных."""
+    logger.info("Creating database session")
+    session = Session()
+
+    try:
+        # Проверка и создание структуры папок
+        logger.info("Starting directory structure check")
+        if create_directory_structure(session):
+            return  # Завершаем работу после создания папок
+
+        # Инициализация Cloudinary
+        logger.info("Initializing Cloudinary")
+        try:
+            init_cloudinary()
+            logger.info("Cloudinary initialized successfully")
+        except UnicodeDecodeError as e:
+            logger.error(f"Unicode decode error during Cloudinary initialization: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize Cloudinary: {str(e)}")
+            raise
+
+        # Обход папок salons и masters
+        for entity_type in ["salons", "masters"]:
+            entity_dir = PHOTOS_DIR / entity_type
+            logger.info(f"Checking directory {entity_dir}")
+            if not entity_dir.exists():
+                logger.warning(f"Directory {entity_dir} does not exist, skipping")
+                continue
+
+            # Проверка содержимого директории
+            try:
+                subdirs = [d for d in entity_dir.iterdir() if d.is_dir()]
+                logger.info(f"Found {len(subdirs)} subdirectories in {entity_dir}")
+            except UnicodeDecodeError as e:
+                logger.error(f"Unicode decode error while listing {entity_dir}: {str(e)}")
+                raise
+            except Exception as e:
+                logger.error(f"Error listing {entity_dir}: {str(e)}")
+                raise
+
+            # Обход подпапок с UUID
+            for entity_id_dir in entity_dir.iterdir():
+                if not entity_id_dir.is_dir():
+                    logger.warning(f"Skipping non-directory item in {entity_dir}: {entity_id_dir}")
+                    continue
+
+                entity_id = entity_id_dir.name
+                logger.info(f"Processing directory: {entity_id_dir}")
+                if not validate_uuid(entity_id):
+                    logger.warning(f"Invalid UUID format in directory {entity_id_dir}, skipping")
+                    continue
+
+                # Проверка существования сущности
+                logger.info(f"Checking if {entity_type[:-1]} with ID {entity_id} exists in database")
+                if not entity_exists(session, entity_type[:-1], uuid.UUID(entity_id)):
+                    logger.warning(f"No {entity_type[:-1]} with ID {entity_id} found in database, skipping")
+                    continue
+
+                logger.info(f"Processing {entity_type[:-1]} with ID {entity_id}")
+
+                # Удаление существующих фотографий из базы
+                logger.info(f"Deleting existing photos for {entity_type[:-1]} {entity_id}")
+                session.query(Photo).filter(
+                    and_(
+                        Photo.entity_type == entity_type[:-1],
+                        Photo.entity_id == uuid.UUID(entity_id)
+                    )
+                ).delete()
+                session.commit()
+                logger.info(f"Deleted existing photos for {entity_type[:-1]} {entity_id}")
+
+                # Обход фотографий в папке
+                photo_files = list(entity_id_dir.glob("*.[jp][pn][gf]"))
+                logger.info(f"Found {len(photo_files)} image files in {entity_id_dir}")
+                for photo_path in photo_files:
+                    logger.info(f"Processing image: {photo_path}")
+                    if is_placeholder(photo_path):
+                        logger.info(f"Skipping placeholder image: {photo_path}")
+                        continue
+
+                    is_primary = photo_path.name.lower().startswith("primary")
+                    try:
+                        # Попытка загрузки в Cloudinary
+                        logger.info(f"Uploading {photo_path} to Cloudinary")
+                        upload_result = cloudinary.uploader.upload(
+                            str(photo_path),
+                            folder=f"{entity_type}/{entity_id}",
+                            resource_type="image"
+                        )
+                        cloudinary_url = upload_result["secure_url"]
+                        logger.info(f"Uploaded {photo_path} to Cloudinary: {cloudinary_url}")
+
+                        # Создание записи в базе
+                        logger.info(f"Adding photo to database: {cloudinary_url}, is_primary={is_primary}")
+                        photo = Photo(
+                            id=uuid.uuid4(),
+                            entity_type=entity_type[:-1],
+                            entity_id=uuid.UUID(entity_id),
+                            photo_path=cloudinary_url,
+                            is_primary=is_primary
+                        )
+                        session.add(photo)
+                        logger.info(f"Added photo to database: {cloudinary_url}, is_primary={is_primary}")
+
+                    except UnicodeDecodeError as e:
+                        logger.error(f"Unicode decode error for {photo_path}: {str(e)}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Failed to upload {photo_path}: {str(e)}")
+                        continue
+
+                # Проверка, что есть хотя бы одна основная фотография
+                logger.info(f"Checking primary photo for {entity_type[:-1]} {entity_id}")
+                primary_count = session.query(Photo).filter(
+                    and_(
+                        Photo.entity_type == entity_type[:-1],
+                        Photo.entity_id == uuid.UUID(entity_id),
+                        Photo.is_primary == True
+                    )
+                ).count()
+
+                if primary_count == 0 and session.query(Photo).filter(
+                        and_(
+                            Photo.entity_type == entity_type[:-1],
+                            Photo.entity_id == uuid.UUID(entity_id)
+                        )
+                ).count() > 0:
+                    # Установить первую фотографию как основную
+                    first_photo = session.query(Photo).filter(
+                        and_(
+                            Photo.entity_type == entity_type[:-1],
+                            Photo.entity_id == uuid.UUID(entity_id)
+                        )
+                    ).first()
+                    if first_photo:
+                        first_photo.is_primary = True
+                        logger.info(
+                            f"No primary photo found for {entity_type[:-1]} {entity_id}, set {first_photo.photo_path} as primary")
+
+                session.commit()
+                logger.info(f"Committed changes for {entity_type[:-1]} {entity_id}")
+
+    except UnicodeDecodeError as e:
+        logger.error(f"Script failed due to Unicode decode error: {str(e)}")
+        session.rollback()
+    except Exception as e:
+        logger.error(f"Script failed: {str(e)}")
+        session.rollback()
+    finally:
+        session.close()
+        logger.info("Database session closed")
+
+
+if __name__ == "__main__":
+    upload_photos()
+
+
